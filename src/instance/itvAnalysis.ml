@@ -320,6 +320,54 @@ let get_locset mem =
     |> BatSet.fold (fun a -> PowLoc.add (Loc.of_allocsite a)) (Val.allocsites_of_val v)
   ) mem PowLoc.empty
 
+let is_fun_loc : Loc.t -> bool
+= fun loc ->
+  match (Loc.typ loc) with
+  | Some(Cil.TFun _) -> true
+  | None | _ -> false
+
+let accessing_global_variable_pid_set : Analysis.Access.t -> Proc.t BatSet.t
+=fun access ->
+  let is_accessing_global_variable : Proc.t -> Analysis.Access.Info.t -> bool
+  =fun pid info ->
+    let use_locs = Analysis.Access.Info.useof info in
+    let use_locs_not_fun = PowLoc.filter (fun x -> not (is_fun_loc x)) use_locs in
+    let def_nodes_of_use_locs = PowLoc.fold (fun loc nodes ->
+          let def_nodes = Analysis.Access.find_def_nodes loc access in
+          PowNode.union def_nodes nodes) use_locs_not_fun PowNode.empty in
+    PowNode.fold (fun def_node acc ->
+        if BasicDom.Node.get_pid def_node = "_G_" then true || acc
+        else acc) def_nodes_of_use_locs false in
+  Analysis.Access.fold (fun node info acc ->
+      let pid = BasicDom.Node.get_pid node in
+      if is_accessing_global_variable pid info then BatSet.add pid acc
+      else acc) access (BatSet.empty)
+
+let side_effectible_parameter_pids : Global.t -> Proc.t BatSet.t
+= fun global ->
+  let is_side_effectible_arg varinfo =
+    match varinfo.vtype with
+    | Cil.TInt _ | Cil.TVoid _ | Cil.TFloat _ | Cil.TEnum _ -> false
+    | _ -> true in
+  let rec has_side_effectible_arg = function
+    | [] -> false
+    | varinfo::acc -> (is_side_effectible_arg varinfo)
+                      || (has_side_effectible_arg acc) in
+  let aux pid pid_set =
+    let args = InterCfg.argsof global.icfg pid in
+    if has_side_effectible_arg args then BatSet.add pid pid_set
+    else pid_set in
+  list_fold aux (InterCfg.pidsof global.icfg) BatSet.empty
+
+let no_side_effect_pids : Global.t -> Analysis.Access.t -> Proc.t BatSet.t
+=fun global access ->
+  let pid_set = BatSet.of_list (InterCfg.pidsof global.icfg) in
+  let side_effect_by_parameter = side_effectible_parameter_pids global in
+  let side_effect_by_accessing_global_variable = accessing_global_variable_pid_set access in
+  let is_side_effect_pid pid = BatSet.mem pid side_effect_by_parameter
+                               || BatSet.mem pid side_effect_by_accessing_global_variable in
+  BatSet.filter (fun pid -> pid <> "_G_" && not (is_side_effect_pid pid)) pid_set
+
 let do_analysis : Global.t -> Global.t * Table.t * Table.t * Report.query list
 = fun global ->
   let _ = prerr_memory_usage () in
@@ -331,7 +379,17 @@ let do_analysis : Global.t -> Global.t * Table.t * Table.t * Report.query list
   let spec = { Spec.empty with
     Spec.locset; Spec.locset_fs; premem = global.mem; Spec.unsound_lib;
     Spec.unsound_update; Spec.unsound_bitwise; } in
-  cond !Options.marshal_in marshal_in (Analysis.perform spec) global
+  let perform_marshal_in () = marshal_in global in
+  let perform_analysis () =
+    let (global, access, inputof, outputof) = Analysis.perform_with_access spec global in
+    let pids = no_side_effect_pids global access in
+    ignore (Printf.printf "--------------------------------------------------\n") ;
+    ignore (Printf.printf "                  no side effect funs             \n") ;
+    ignore (Printf.printf "--------------------------------------------------\n") ;
+    ignore (Printf.printf "%s\n" (BatSet.fold (fun x acc -> link_by_sep "\n" (Proc.to_string x) acc) pids "")) ;
+    ignore (Printf.printf "--------------------------------------------------\n") ;
+    (global, inputof, outputof) in
+  cond !Options.marshal_in (perform_marshal_in) (perform_analysis) ()
   |> opt !Options.marshal_out marshal_out
   |> StepManager.stepf true "Generate Alarm Report" (fun (global,inputof,outputof) ->
       (global,inputof,outputof,inspect_alarm global spec inputof))

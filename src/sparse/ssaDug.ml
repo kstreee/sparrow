@@ -179,7 +179,7 @@ struct
       List.fold_left (fun m node ->
         IntraNodeMap.add node (f (global,access) (Node.make (IntraCfg.get_pid cfg) node) locset) m
       ) IntraNodeMap.empty (IntraCfg.nodesof cfg) in
-      (collect lhsof, collect rhsof)
+    (collect lhsof, collect rhsof)
 
   let prepare_defnodes : Global.t * Access.t -> IntraCfg.t -> access_map -> access_map_inv
   =fun (global,access) cfg defs_of ->

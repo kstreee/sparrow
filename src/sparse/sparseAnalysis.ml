@@ -13,6 +13,7 @@ open Global
 open BasicDom
 open AbsSem
 open Dug
+open Cil
 
 let total_iterations = ref 0
 let g_clock = ref 0.0
@@ -23,7 +24,9 @@ sig
   module Dom : InstrumentedMem.S
   module Table : MapDom.CPO with type t = MapDom.MakeCPO(BasicDom.Node)(Dom).t and type A.t = BasicDom.Node.t and type B.t = Dom.t
   module Spec : Spec.S with type Dom.t = Dom.t and type Dom.A.t = Dom.A.t and type Dom.PowA.t = Dom.PowA.t
+  module Access : Access.S with type PowLoc.t = Dom.PowA.t and type Loc.t = Dom.A.t
   val perform : Spec.t -> Global.t -> Global.t * Table.t * Table.t
+  val perform_with_access : Spec.t -> Global.t -> Global.t * Access.t * Table.t * Table.t
 end
 
 module MakeWithAccess (Sem:AccessSem.S) =
@@ -37,6 +40,7 @@ struct
   module Table = MapDom.MakeCPO (Node) (Sem.Dom)
   module Spec = Sem.Spec
   module PowLoc = Sem.Dom.PowA
+  module Loc = Sem.Dom.A
 
   let needwidening : DUGraph.node -> Worklist.t -> bool
   =fun idx wl -> Worklist.is_loopheader idx wl
@@ -190,7 +194,6 @@ struct
         [ ("callgraph", CallGraph.to_json global.callgraph);
           ("cfgs", InterCfg.to_json global.icfg);
           ("dugraph", DUGraph.to_json dug);
-(*          ("dugraph-inter", DUGraph.to_json_inter dug access);*)
         ]
       |> Yojson.Safe.pretty_to_channel stdout;
       exit 0
@@ -246,7 +249,7 @@ struct
     my_prerr_endline ("#total abstract locations  = " ^ string_of_int (PowLoc.cardinal spec.Spec.locset));
     my_prerr_endline ("#flow-sensitive abstract locations  = " ^ string_of_int (PowLoc.cardinal spec.Spec.locset_fs))
 
-  let perform : Spec.t -> Global.t -> Global.t * Table.t * Table.t
+  let perform_with_access : Spec.t -> Global.t -> Global.t * Access.t * Table.t * Table.t
   =fun spec global ->
     print_spec spec;
     let access = StepManager.stepf false "Access Analysis" (AccessAnalysis.perform global spec.Spec.locset (Sem.run Strong spec)) spec.Spec.premem in
@@ -257,7 +260,12 @@ struct
     |> StepManager.stepf false "Fixpoint iteration with widening" (widening spec dug)
     |> finalize spec global dug access
     |> StepManager.stepf_opt !Options.narrow false "Fixpoint iteration with narrowing" (narrowing spec dug)
-    |> (fun (_,global,inputof,outputof) -> (global, inputof, outputof))
+    |> (fun (_,global,inputof,outputof) -> (global, access, inputof, outputof))
+
+  let perform : Spec.t -> Global.t -> Global.t * Table.t * Table.t
+  =fun spec global ->
+    let (global, _, inputof, outputof) = perform_with_access spec global in
+    (global, inputof, outputof)
 end
 
 module Make (Sem:AbsSem.S) = MakeWithAccess (AccessSem.Make (Sem))
