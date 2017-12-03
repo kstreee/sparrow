@@ -13,6 +13,7 @@ open Global
 open BasicDom
 open AbsSem
 open Dug
+open Cil
 
 let total_iterations = ref 0
 let g_clock = ref 0.0
@@ -24,6 +25,7 @@ sig
   module Table : MapDom.CPO with type t = MapDom.MakeCPO(BasicDom.Node)(Dom).t and type A.t = BasicDom.Node.t and type B.t = Dom.t
   module Spec : Spec.S with type Dom.t = Dom.t and type Dom.A.t = Dom.A.t and type Dom.PowA.t = Dom.PowA.t
   val perform : Spec.t -> Global.t -> Global.t * Table.t * Table.t
+  val perform_no_side_effect : Spec.t -> (Dom.A.t -> bool) -> Global.t -> Global.t * Table.t * Table.t
 end
 
 module MakeWithAccess (Sem:AccessSem.S) =
@@ -190,7 +192,6 @@ struct
         [ ("callgraph", CallGraph.to_json global.callgraph);
           ("cfgs", InterCfg.to_json global.icfg);
           ("dugraph", DUGraph.to_json dug);
-(*          ("dugraph-inter", DUGraph.to_json_inter dug access);*)
         ]
       |> Yojson.Safe.pretty_to_channel stdout;
       exit 0
@@ -201,6 +202,49 @@ struct
       prerr_endline ("#Nodes in def-use graph : " ^ i2s (DUGraph.nb_node dug));
       prerr_endline ("#Locs on def-use graph : " ^ i2s (DUGraph.nb_loc dug));
     end
+
+  let find_accessing_global_variable_pids access is_not_func_loc =
+    let is_accessing_global_variable pid info =
+      let use_locs = Access.Info.useof info in
+      let use_locs_not_fun = PowLoc.filter is_not_func_loc use_locs in
+      let def_nodes_of_use_locs = PowLoc.fold (fun loc nodes ->
+              let def_nodes = Access.find_def_nodes loc access in
+              PowNode.union def_nodes nodes) use_locs_not_fun PowNode.empty in
+      (*
+      ignore (Printf.printf "inspecting %s\n" pid) ;
+      ignore (Printf.printf "use locs %s\n" (PowLoc.to_string use_locs)) ;
+      ignore (Printf.printf "use locs not fun %s\n" (PowLoc.to_string use_locs_not_fun)) ;
+      ignore (Printf.printf "def nodes of use locs %s\n" (PowNode.to_string def_nodes_of_use_locs)) ;
+      ignore (Printf.printf "\n") ;
+       *)
+      PowNode.fold (fun def_node acc ->
+            if BasicDom.Node.get_pid def_node = "_G_" then true || acc
+            else acc) def_nodes_of_use_locs false in
+
+    Access.fold (fun node info acc ->
+          let pid = BasicDom.Node.get_pid node in
+          if is_accessing_global_variable pid info then BatSet.add pid acc
+          else acc) access (BatSet.empty)
+
+  let find_side_effectible_parameter_pids global =
+    let is_side_effectible_arg varinfo =
+      match varinfo.vtype with
+      | Cil.TInt _ | Cil.TVoid _ | Cil.TFloat _ | Cil.TEnum _ -> false
+      | _ -> true in
+    let rec has_side_effectible_arg = function
+      | [] -> false
+      | varinfo::acc -> (is_side_effectible_arg varinfo) || (has_side_effectible_arg acc) in
+    list_fold (fun pid pid_set ->
+          if has_side_effectible_arg (InterCfg.argsof global.icfg pid) then BatSet.add pid pid_set
+          else pid_set) (InterCfg.pidsof global.icfg) BatSet.empty
+
+  let find_no_side_effect_pids global access is_not_func_loc =
+    let pid_set = BatSet.of_list (InterCfg.pidsof global.icfg) in
+    let global_variable_pid_set = find_accessing_global_variable_pids access is_not_func_loc in
+    let parameter_pid_set = find_side_effectible_parameter_pids global in
+    let is_side_effect_pid pid = BatSet.mem pid global_variable_pid_set
+                                 || BatSet.mem pid parameter_pid_set in
+    BatSet.filter (fun pid -> pid <> "_G_" && not (is_side_effect_pid pid)) pid_set
 
   let bind_fi_locs global mem_fi dug access inputof =
     DUGraph.fold_node (fun n t ->
@@ -252,6 +296,27 @@ struct
     let access = StepManager.stepf false "Access Analysis" (AccessAnalysis.perform global spec.Spec.locset (Sem.run Strong spec)) spec.Spec.premem in
     let dug = StepManager.stepf false "Def-use graph construction" SsaDug.make (global, access, spec.Spec.locset_fs) in
     print_dug (access,global,dug);
+    let worklist = StepManager.stepf false "Workorder computation" Worklist.init dug in
+    (worklist, global, initialize spec global dug access, Table.empty)
+    |> StepManager.stepf false "Fixpoint iteration with widening" (widening spec dug)
+    |> finalize spec global dug access
+    |> StepManager.stepf_opt !Options.narrow false "Fixpoint iteration with narrowing" (narrowing spec dug)
+    |> (fun (_,global,inputof,outputof) -> (global, inputof, outputof))
+
+  let perform_no_side_effect : Spec.t -> (Dom.A.t -> bool) -> Global.t -> Global.t * Table.t * Table.t
+  =fun spec is_func_loc global ->
+    print_spec spec;
+    let access = StepManager.stepf false "Access Analysis" (AccessAnalysis.perform global spec.Spec.locset (Sem.run Strong spec)) spec.Spec.premem in
+    let dug = StepManager.stepf false "Def-use graph construction" SsaDug.make (global, access, spec.Spec.locset_fs) in
+    print_dug (access,global,dug);
+
+    let _ = Printf.printf "-------------------------------\n" in
+    let _ = Printf.printf "      no side effect pids      \n" in
+    let _ = Printf.printf "-------------------------------\n" in
+    let pids = find_no_side_effect_pids global access (fun x -> not (is_func_loc x)) in
+    let _ = Printf.printf "%s\n" (BatSet.fold (fun x acc -> link_by_sep "\n" x acc) pids "") in
+    let _ = Printf.printf "-------------------------------\n" in
+
     let worklist = StepManager.stepf false "Workorder computation" Worklist.init dug in
     (worklist, global, initialize spec global dug access, Table.empty)
     |> StepManager.stepf false "Fixpoint iteration with widening" (widening spec dug)
